@@ -18,7 +18,7 @@ class OkumaLatheInterface(Node):
     """
     ROS2 Node for interfacing with an Okuma CNC lathe.
 
-    This node provides interfaces for controlling the door,
+    This node provides interfaces for controlling the door, collet,
     executing CNC programs, and monitoring machine state.
 
     Communication is implemented using the Okuma THINC API over Ethernet.
@@ -58,6 +58,12 @@ class OkumaLatheInterface(Node):
             10
         )
 
+        self.collet_state_publisher = self.create_publisher(
+            Bool,
+            'lathe/collet_state',  # True = closed, False = open
+            10
+        )
+
         self.program_complete_publisher = self.create_publisher(
             Bool,
             'lathe/program_complete',
@@ -76,6 +82,21 @@ class OkumaLatheInterface(Node):
             Trigger,
             'lathe/close_door',
             self.handle_close_door,
+            callback_group=cb_group
+        )
+
+        # Add collet control services
+        self.open_collet_service = self.create_service(
+            Trigger,
+            'lathe/open_collet',
+            self.handle_open_collet,
+            callback_group=cb_group
+        )
+
+        self.close_collet_service = self.create_service(
+            Trigger,
+            'lathe/close_collet',
+            self.handle_close_collet,
             callback_group=cb_group
         )
 
@@ -187,6 +208,11 @@ class OkumaLatheInterface(Node):
     CMD_EXECUTE_PROGRAM = 0x0005
     CMD_GET_PROGRAM_STATE = 0x0006
 
+    # New collet command codes
+    CMD_GET_COLLET_STATE = 0x0007
+    CMD_OPEN_COLLET = 0x0008
+    CMD_CLOSE_COLLET = 0x0009
+
     def get_machine_state(self):
         """Get the current state of the machine."""
         success, data = self.send_command(self.CMD_GET_STATE)
@@ -231,6 +257,21 @@ class OkumaLatheInterface(Node):
             self.get_logger().error(f"Error parsing door state: {e}")
             return None
 
+    def get_collet_state(self):
+        """Get the current state of the collet (open/closed)."""
+        success, data = self.send_command(self.CMD_GET_COLLET_STATE)
+        if not success or not data:
+            return None
+
+        # Parse collet state
+        # Assuming 1 byte response: 0 = open, 1 = closed
+        try:
+            collet_state = struct.unpack('>B', data)[0]
+            return bool(collet_state)  # True = closed, False = open
+        except struct.error as e:
+            self.get_logger().error(f"Error parsing collet state: {e}")
+            return None
+
     def get_program_state(self):
         """Check if the current program is complete."""
         success, data = self.send_command(self.CMD_GET_PROGRAM_STATE)
@@ -256,6 +297,16 @@ class OkumaLatheInterface(Node):
         success, _ = self.send_command(self.CMD_CLOSE_DOOR)
         return success
 
+    def open_collet(self):
+        """Command to open the collet."""
+        success, _ = self.send_command(self.CMD_OPEN_COLLET)
+        return success
+
+    def close_collet(self):
+        """Command to close the collet."""
+        success, _ = self.send_command(self.CMD_CLOSE_COLLET)
+        return success
+
     def execute_program(self, program_number):
         """Command to execute a specific program on the machine."""
         # Convert program number to bytes and send command
@@ -275,6 +326,11 @@ class OkumaLatheInterface(Node):
         if door_state is not None:
             self.door_state_publisher.publish(Bool(data=door_state))
 
+        # Get and publish collet state
+        collet_state = self.get_collet_state()
+        if collet_state is not None:
+            self.collet_state_publisher.publish(Bool(data=collet_state))
+
         # Get and publish program complete status
         program_complete = self.get_program_state()
         if program_complete is not None:
@@ -292,6 +348,20 @@ class OkumaLatheInterface(Node):
         success = self.close_door()
         response.success = success
         response.message = "Door close command sent successfully" if success else "Failed to send door close command"
+        return response
+
+    def handle_open_collet(self, request, response):
+        """Handle open collet service request."""
+        success = self.open_collet()
+        response.success = success
+        response.message = "Collet open command sent successfully" if success else "Failed to send collet open command"
+        return response
+
+    def handle_close_collet(self, request, response):
+        """Handle close collet service request."""
+        success = self.close_collet()
+        response.success = success
+        response.message = "Collet close command sent successfully" if success else "Failed to send collet close command"
         return response
 
     def handle_execute_program(self, request, response):
