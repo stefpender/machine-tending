@@ -1,0 +1,28 @@
+# ROS 2 Package Structure for Robotiq Hand-E C10 Gripper
+
+The package structure follows standard ROS 2 conventions:
+
+```
+robotiq_hand_e_driver/
+├── robotiq_hand_e_driver/
+│   ├── __init__.py
+│   ├── robotiq_hand_e_driver.py
+│   ├── hand_e_hardware_interface.py
+│   └── hand_e_node.py
+├── launch/
+│   └── hand_e_driver.launch.py
+├── config/
+│   └── hand_e_params.yaml
+├── msg/
+│   ├── GripperCommand.msg
+│   └── GripperStatus.msg
+├── srv/
+│   ├── GripperActivation.srv
+│   ├── GripperEmergencyRelease.srv
+│   └── GripperReset.srv
+├── CMakeLists.txt
+├── package.xml
+├── setup.py
+├── setup.cfg
+└── README.md
+```
