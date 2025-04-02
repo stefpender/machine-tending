@@ -3,44 +3,61 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64, String, Int32
 from std_srvs.srv import Trigger
-import socket
-import time
-import struct
 import threading
-from functools import partial
+import time
+import clr
+import sys
+import os
 from custom_interfaces.msg import MachineState
 from custom_interfaces.srv import ExecuteProgram
+
+# Add references to the Okuma API assemblies
+# These paths would need to be adjusted based on actual installation location
+OKUMA_API_PATH = os.environ.get('OKUMA_API_PATH', 'C:/Program Files (x86)/Okuma/Open API/')
+
+# Add Okuma API path to the system path
+sys.path.append(OKUMA_API_PATH)
+
+# Load Okuma API assemblies using Python.NET
+clr.AddReference('Okuma.CLDATAPI.DataAPI')
+clr.AddReference('Okuma.CMDATAPI.DataAPI')
+clr.AddReference('Okuma.CMCMDAPI.CommandAPI')
+
+# Import Okuma namespaces
+from Okuma.CLDATAPI.DataAPI import CNCLathe
+from Okuma.CMDATAPI.DataAPI import CMachine
+from Okuma.CMCMDAPI.CommandAPI import CNCLathe as CNCLatheCommand
 
 
 class OkumaLatheInterface(Node):
     """
-    ROS2 Node for interfacing with an Okuma CNC lathe.
+    ROS2 Node for interfacing with an Okuma CNC lathe using the official Okuma Open API SDK.
 
-    This node provides interfaces for controlling the door, collet,
+    This node provides interfaces for controlling the door, collet, spindle,
     executing CNC programs, and monitoring machine state.
-
-    Communication is implemented using the Okuma THINC API over Ethernet.
     """
 
     def __init__(self):
         super().__init__('okuma_lathe_interface')
 
         # Parameters
-        self.declare_parameter('lathe_ip', '192.168.1.10')
-        self.declare_parameter('lathe_port', 8193)  # Default port for Okuma THINC API
         self.declare_parameter('poll_rate', 5.0)  # Hz
-        self.declare_parameter('connection_timeout', 5.0)  # seconds
+        self.declare_parameter('connect_retry_interval', 5.0)  # seconds
 
-        self.lathe_ip = self.get_parameter('lathe_ip').get_parameter_value().string_value
-        self.lathe_port = self.get_parameter('lathe_port').get_parameter_value().integer_value
-        self.connection_timeout = self.get_parameter('connection_timeout').get_parameter_value().double_value
+        self.poll_rate = self.get_parameter('poll_rate').get_parameter_value().double_value
+        self.connect_retry_interval = self.get_parameter('connect_retry_interval').get_parameter_value().double_value
 
-        # Connection state
+        # Initialize connection state
         self.connected = False
-        self.socket = None
         self.lock = threading.Lock()
+        self.api_initialized = False
+
+        # API instances
+        self.cnc_lathe = None
+        self.machine = None
+        self.command = None
 
         # Create callback group for concurrent execution
         cb_group = ReentrantCallbackGroup()
@@ -54,7 +71,7 @@ class OkumaLatheInterface(Node):
 
         self.door_state_publisher = self.create_publisher(
             Bool,
-            'lathe/door_state',
+            'lathe/door_state',  # True = open, False = closed
             10
         )
 
@@ -64,9 +81,33 @@ class OkumaLatheInterface(Node):
             10
         )
 
-        self.program_complete_publisher = self.create_publisher(
-            Bool,
-            'lathe/program_complete',
+        self.program_name_publisher = self.create_publisher(
+            String,
+            'lathe/current_program',
+            10
+        )
+
+        self.spindle_speed_publisher = self.create_publisher(
+            Float64,
+            'lathe/spindle_speed',
+            10
+        )
+
+        self.alarm_publisher = self.create_publisher(
+            String,
+            'lathe/alarm',
+            10
+        )
+
+        self.operation_mode_publisher = self.create_publisher(
+            String,
+            'lathe/operation_mode',
+            10
+        )
+
+        self.execution_mode_publisher = self.create_publisher(
+            String,
+            'lathe/execution_mode',
             10
         )
 
@@ -85,7 +126,6 @@ class OkumaLatheInterface(Node):
             callback_group=cb_group
         )
 
-        # Add collet control services
         self.open_collet_service = self.create_service(
             Trigger,
             'lathe/open_collet',
@@ -107,212 +147,349 @@ class OkumaLatheInterface(Node):
             callback_group=cb_group
         )
 
+        self.cycle_start_service = self.create_service(
+            Trigger,
+            'lathe/cycle_start',
+            self.handle_cycle_start,
+            callback_group=cb_group
+        )
+
+        self.cycle_stop_service = self.create_service(
+            Trigger,
+            'lathe/cycle_stop',
+            self.handle_cycle_stop,
+            callback_group=cb_group
+        )
+
+        self.reset_service = self.create_service(
+            Trigger,
+            'lathe/reset',
+            self.handle_reset,
+            callback_group=cb_group
+        )
+
         # Create timer for state polling
         self.timer = self.create_timer(
-            1.0 / self.get_parameter('poll_rate').get_parameter_value().double_value,
+            1.0 / self.poll_rate,
             self.publish_state,
             callback_group=cb_group
         )
 
-        self.get_logger().info(f"Okuma lathe interface initialized. "
-                               f"Connecting to {self.lathe_ip}:{self.lathe_port}")
+        self.get_logger().info("Okuma lathe interface initialized.")
 
-        # Initial connection attempt
-        self.connect()
+        # Start connection thread
+        self.connection_thread = threading.Thread(target=self.connection_worker)
+        self.connection_thread.daemon = True
+        self.connection_thread.start()
+
+    def initialize_api(self):
+        """Initialize the Okuma API instances."""
+        try:
+            # Initialize API instances
+            self.cnc_lathe = CNCLathe()
+            self.machine = CMachine()
+            self.command = CNCLatheCommand()
+
+            self.api_initialized = True
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize Okuma API: {str(e)}")
+            self.api_initialized = False
+            return False
 
     def connect(self):
-        """Connect to the Okuma lathe's THINC API."""
+        """Connect to the Okuma lathe using the API."""
         with self.lock:
             if self.connected:
                 return True
 
+            if not self.api_initialized and not self.initialize_api():
+                return False
+
             try:
-                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.socket.settimeout(self.connection_timeout)
-                self.socket.connect((self.lathe_ip, self.lathe_port))
+                # Initialize the API connection
+                self.cnc_lathe.InitializeClass()
+                self.machine.InitializeClass()
+                self.command.InitializeClass()
+
+                # Verify connection by attempting to get machine info
+                version = self.cnc_lathe.GetLibraryVersion()
+                self.get_logger().info(f"Connected to Okuma lathe. API version: {version}")
+
                 self.connected = True
-                self.get_logger().info("Connected to Okuma lathe")
                 return True
-            except socket.error as e:
-                self.get_logger().error(f"Failed to connect to Okuma lathe: {e}")
+            except Exception as e:
+                self.get_logger().error(f"Failed to connect to Okuma lathe: {str(e)}")
                 self.connected = False
-                self.socket = None
                 return False
 
     def disconnect(self):
-        """Disconnect from the Okuma lathe's THINC API."""
-        with self.lock:
-            if self.socket:
-                try:
-                    self.socket.close()
-                except:
-                    pass
-                finally:
-                    self.socket = None
-                    self.connected = False
-
-    def send_command(self, command_code, data=None):
-        """
-        Send a command to the Okuma lathe.
-
-        Args:
-            command_code (int): The code for the command
-            data (bytes, optional): Additional data for the command
-
-        Returns:
-            tuple: (success, response_data)
-        """
-        if data is None:
-            data = b''
-
-        # Command format:
-        # - 4 bytes: Command code (int)
-        # - 4 bytes: Data length (int)
-        # - N bytes: Data
+        """Disconnect from the Okuma lathe API."""
         with self.lock:
             if not self.connected:
-                if not self.connect():
-                    return False, None
+                return
 
             try:
-                # Prepare command packet
-                packet = struct.pack('>II', command_code, len(data)) + data
+                if self.cnc_lathe:
+                    self.cnc_lathe.Close()
+                if self.machine:
+                    self.machine.Close()
+                if self.command:
+                    self.command.Close()
 
-                # Send command
-                self.socket.sendall(packet)
-
-                # Receive response
-                # - 4 bytes: Status code (int)
-                # - 4 bytes: Data length (int)
-                # - N bytes: Data
-                header = self.socket.recv(8)
-                status, data_length = struct.unpack('>II', header)
-
-                response_data = b''
-                if data_length > 0:
-                    response_data = self.socket.recv(data_length)
-
-                return status == 0, response_data
-
-            except socket.error as e:
-                self.get_logger().error(f"Communication error with lathe: {e}")
                 self.connected = False
-                self.socket = None
-                return False, None
+                self.get_logger().info("Disconnected from Okuma lathe")
+            except Exception as e:
+                self.get_logger().error(f"Error during disconnection: {str(e)}")
 
-    # Okuma THINC API command codes (hypothetical - would need to match actual API)
-    CMD_GET_STATE = 0x0001
-    CMD_GET_DOOR_STATE = 0x0002
-    CMD_OPEN_DOOR = 0x0003
-    CMD_CLOSE_DOOR = 0x0004
-    CMD_EXECUTE_PROGRAM = 0x0005
-    CMD_GET_PROGRAM_STATE = 0x0006
-
-    # New collet command codes
-    CMD_GET_COLLET_STATE = 0x0007
-    CMD_OPEN_COLLET = 0x0008
-    CMD_CLOSE_COLLET = 0x0009
+    def connection_worker(self):
+        """Background thread to maintain connection to the lathe."""
+        while True:
+            if not self.connected:
+                self.connect()
+            time.sleep(self.connect_retry_interval)
 
     def get_machine_state(self):
         """Get the current state of the machine."""
-        success, data = self.send_command(self.CMD_GET_STATE)
-        if not success or not data:
-            return None
+        with self.lock:
+            if not self.connected and not self.connect():
+                return None
 
-        # Parse machine state data
-        # Format depends on actual API, this is a placeholder
-        try:
-            # Example state structure:
-            # - Byte 0: Machine mode (0=auto, 1=manual, etc.)
-            # - Byte 1: Error code
-            # - Byte 2-5: Current spindle speed (float)
-            # - Byte 6-9: Feed rate (float)
-            mode, error = struct.unpack('>BB', data[0:2])
-            spindle_speed, feed_rate = struct.unpack('>ff', data[2:10])
+            try:
+                state = MachineState()
 
-            state = MachineState()
-            state.mode = mode
-            state.error_code = error
-            state.spindle_speed = spindle_speed
-            state.feed_rate = feed_rate
+                # Get basic machine information
+                state.operation_mode = self.machine.GetOperationMode()
+                state.execution_mode = self.cnc_lathe.GetExecutionMode()
+                state.spindle_speed = self.cnc_lathe.GetActualSpindleSpeed()
+                state.feed_rate = self.cnc_lathe.GetActualFeedrate()
+                state.rapid_override = self.cnc_lathe.GetRapidOverride()
+                state.spindle_override = self.cnc_lathe.GetSpindleOverride()
+                state.feedrate_override = self.cnc_lathe.GetFeedrateOverride()
 
-            return state
+                # Check if any alarms are active
+                if self.machine.GetAlarmStatus():
+                    state.alarm_active = True
+                    # Retrieve first active alarm as an example
+                    alarms = self.machine.GetAlarms()
+                    if alarms and len(alarms) > 0:
+                        state.alarm_message = alarms[0].GetAlarmMessage()
+                else:
+                    state.alarm_active = False
+                    state.alarm_message = ""
 
-        except struct.error as e:
-            self.get_logger().error(f"Error parsing machine state: {e}")
-            return None
+                return state
+            except Exception as e:
+                self.get_logger().error(f"Error getting machine state: {str(e)}")
+                self.connected = False
+                return None
 
     def get_door_state(self):
         """Get the current state of the machine door (open/closed)."""
-        success, data = self.send_command(self.CMD_GET_DOOR_STATE)
-        if not success or not data:
-            return None
+        with self.lock:
+            if not self.connected and not self.connect():
+                return None
 
-        # Parse door state
-        # Assuming 1 byte response: 0 = closed, 1 = open
-        try:
-            door_state = struct.unpack('>B', data)[0]
-            return bool(door_state)
-        except struct.error as e:
-            self.get_logger().error(f"Error parsing door state: {e}")
-            return None
+            try:
+                # Note: The exact method name may vary based on API version
+                # Some versions use IsDoorOpen() instead of GetDoorState()
+                try:
+                    return self.cnc_lathe.IsDoorOpen()
+                except AttributeError:
+                    try:
+                        return self.cnc_lathe.GetDoorState()
+                    except:
+                        self.get_logger().warn("Door state method not found in API")
+                        return None
+            except Exception as e:
+                self.get_logger().error(f"Error getting door state: {str(e)}")
+                self.connected = False
+                return None
 
     def get_collet_state(self):
         """Get the current state of the collet (open/closed)."""
-        success, data = self.send_command(self.CMD_GET_COLLET_STATE)
-        if not success or not data:
-            return None
+        with self.lock:
+            if not self.connected and not self.connect():
+                return None
 
-        # Parse collet state
-        # Assuming 1 byte response: 0 = open, 1 = closed
-        try:
-            collet_state = struct.unpack('>B', data)[0]
-            return bool(collet_state)  # True = closed, False = open
-        except struct.error as e:
-            self.get_logger().error(f"Error parsing collet state: {e}")
-            return None
+            try:
+                # Check chuck open/close status
+                # True = closed, False = open
+                try:
+                    # Depending on the machine, this might be GetChuckState or GetColletState
+                    return self.cnc_lathe.GetChuckClampStatus()
+                except AttributeError:
+                    try:
+                        return self.cnc_lathe.GetColletClampStatus()
+                    except:
+                        self.get_logger().warn("Collet/Chuck state method not found in API")
+                        return None
+            except Exception as e:
+                self.get_logger().error(f"Error getting collet state: {str(e)}")
+                self.connected = False
+                return None
 
-    def get_program_state(self):
-        """Check if the current program is complete."""
-        success, data = self.send_command(self.CMD_GET_PROGRAM_STATE)
-        if not success or not data:
-            return None
+    def get_spindle_speed(self):
+        """Get the current spindle speed."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return None
 
-        # Parse program state
-        # Assuming 1 byte response: 0 = running, 1 = complete, 2 = error
-        try:
-            program_state = struct.unpack('>B', data)[0]
-            return program_state == 1  # True if complete
-        except struct.error as e:
-            self.get_logger().error(f"Error parsing program state: {e}")
-            return None
+            try:
+                return self.cnc_lathe.GetActualSpindleSpeed()
+            except Exception as e:
+                self.get_logger().error(f"Error getting spindle speed: {str(e)}")
+                self.connected = False
+                return None
+
+    def get_current_program(self):
+        """Get the name of the currently loaded program."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return None
+
+            try:
+                return self.cnc_lathe.GetActiveProgramFileName()
+            except Exception as e:
+                self.get_logger().error(f"Error getting current program: {str(e)}")
+                self.connected = False
+                return None
 
     def open_door(self):
         """Command to open the machine door."""
-        success, _ = self.send_command(self.CMD_OPEN_DOOR)
-        return success
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                self.command.SetDoor(True)  # True for open
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Error opening door: {str(e)}")
+                self.connected = False
+                return False
 
     def close_door(self):
         """Command to close the machine door."""
-        success, _ = self.send_command(self.CMD_CLOSE_DOOR)
-        return success
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                self.command.SetDoor(False)  # False for closed
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Error closing door: {str(e)}")
+                self.connected = False
+                return False
 
     def open_collet(self):
-        """Command to open the collet."""
-        success, _ = self.send_command(self.CMD_OPEN_COLLET)
-        return success
+        """Command to open the collet/chuck."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                # Try different possible methods
+                try:
+                    self.command.UnclampChuck()
+                    return True
+                except AttributeError:
+                    try:
+                        self.command.UnclampCollet()
+                        return True
+                    except:
+                        self.get_logger().error("Collet/Chuck unclamp method not found in API")
+                        return False
+            except Exception as e:
+                self.get_logger().error(f"Error opening collet: {str(e)}")
+                self.connected = False
+                return False
 
     def close_collet(self):
-        """Command to close the collet."""
-        success, _ = self.send_command(self.CMD_CLOSE_COLLET)
-        return success
+        """Command to close the collet/chuck."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                # Try different possible methods
+                try:
+                    self.command.ClampChuck()
+                    return True
+                except AttributeError:
+                    try:
+                        self.command.ClampCollet()
+                        return True
+                    except:
+                        self.get_logger().error("Collet/Chuck clamp method not found in API")
+                        return False
+            except Exception as e:
+                self.get_logger().error(f"Error closing collet: {str(e)}")
+                self.connected = False
+                return False
 
     def execute_program(self, program_number):
         """Command to execute a specific program on the machine."""
-        # Convert program number to bytes and send command
-        data = struct.pack('>I', program_number)
-        success, _ = self.send_command(self.CMD_EXECUTE_PROGRAM, data)
-        return success
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                # Format program number according to Okuma conventions
+                program_name = f"O{program_number}"
+
+                # Select the program
+                self.command.SelectMainProgram(program_name)
+
+                # CycleStart will be called separately
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Error selecting program {program_number}: {str(e)}")
+                self.connected = False
+                return False
+
+    def cycle_start(self):
+        """Command to start the machining cycle."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                self.command.CycleStart()
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Error starting cycle: {str(e)}")
+                self.connected = False
+                return False
+
+    def cycle_stop(self):
+        """Command to stop the machining cycle."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                self.command.CycleStop()
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Error stopping cycle: {str(e)}")
+                self.connected = False
+                return False
+
+    def reset_machine(self):
+        """Command to reset the machine."""
+        with self.lock:
+            if not self.connected and not self.connect():
+                return False
+
+            try:
+                self.command.ResetCNC()
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Error resetting machine: {str(e)}")
+                self.connected = False
+                return False
 
     def publish_state(self):
         """Publish the current state of the lathe."""
@@ -331,10 +508,27 @@ class OkumaLatheInterface(Node):
         if collet_state is not None:
             self.collet_state_publisher.publish(Bool(data=collet_state))
 
-        # Get and publish program complete status
-        program_complete = self.get_program_state()
-        if program_complete is not None:
-            self.program_complete_publisher.publish(Bool(data=program_complete))
+        # Get and publish spindle speed
+        spindle_speed = self.get_spindle_speed()
+        if spindle_speed is not None:
+            self.spindle_speed_publisher.publish(Float64(data=float(spindle_speed)))
+
+        # Get and publish current program
+        program = self.get_current_program()
+        if program is not None:
+            self.program_name_publisher.publish(String(data=program))
+
+        # Publish additional status information if state is available
+        if state:
+            # Publish operation mode
+            self.operation_mode_publisher.publish(String(data=str(state.operation_mode)))
+
+            # Publish execution mode
+            self.execution_mode_publisher.publish(String(data=str(state.execution_mode)))
+
+            # Publish alarm if active
+            if state.alarm_active:
+                self.alarm_publisher.publish(String(data=state.alarm_message))
 
     def handle_open_door(self, request, response):
         """Handle open door service request."""
@@ -369,7 +563,28 @@ class OkumaLatheInterface(Node):
         program_number = request.program_number
         success = self.execute_program(program_number)
         response.success = success
-        response.message = f"Program {program_number} execution started" if success else f"Failed to start program {program_number}"
+        response.message = f"Program {program_number} selected successfully" if success else f"Failed to select program {program_number}"
+        return response
+
+    def handle_cycle_start(self, request, response):
+        """Handle cycle start service request."""
+        success = self.cycle_start()
+        response.success = success
+        response.message = "Cycle start command sent successfully" if success else "Failed to send cycle start command"
+        return response
+
+    def handle_cycle_stop(self, request, response):
+        """Handle cycle stop service request."""
+        success = self.cycle_stop()
+        response.success = success
+        response.message = "Cycle stop command sent successfully" if success else "Failed to send cycle stop command"
+        return response
+
+    def handle_reset(self, request, response):
+        """Handle reset service request."""
+        success = self.reset_machine()
+        response.success = success
+        response.message = "Reset command sent successfully" if success else "Failed to send reset command"
         return response
 
 
